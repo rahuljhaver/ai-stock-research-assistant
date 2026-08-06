@@ -1,36 +1,39 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
-# MAGIC # Ingest Ticker News -> Vector Embeddings (Lakebase)
+# MAGIC # Ingest Ticker News -> Vector Embeddings (Delta + Lakebase)
 # MAGIC
 # MAGIC This notebook is part of the **Context Engineering on Databricks** course.
 # MAGIC
-# MAGIC It:
-# MAGIC 1. Reads the `watchlist` table in Lakebase to find out which ticker
+# MAGIC It writes to **both** Unity Catalog Delta tables AND Lakebase Postgres:
+# MAGIC
+# MAGIC 1. Reads the `watchlist` table from Unity Catalog to find out which ticker
 # MAGIC    symbols are currently being tracked.
 # MAGIC 2. Fetches recent news for those tickers directly from the Massive
-# MAGIC    `/v2/reference/news` endpoint (see `massive_client.py` for the same
-# MAGIC    call shape used by the Flask app's `POST /news/sync` route), rate
-# MAGIC    limited to stay within the free Massive API tier's strict quota, and
-# MAGIC    upserts the results into the `ticker_news_documents` table.
+# MAGIC    `/v2/reference/news` endpoint, rate limited to stay within the free
+# MAGIC    Massive API tier's strict quota, and writes to:
+# MAGIC    - **Delta**: `ticker_news_documents` (JSON columns as STRING)
+# MAGIC    - **Lakebase**: `ticker_news_documents` (with JSONB columns)
 # MAGIC 3. Computes a sentence embedding for each article (title + description)
-# MAGIC    using Spark, distributed across the cluster via a pandas UDF, and
-# MAGIC    writes them into a `ticker_news_embeddings` table using the
-# MAGIC    `pgvector` Postgres extension so downstream RAG / context-engineering
-# MAGIC    exercises can run similarity search directly in Postgres.
+# MAGIC    using Spark, distributed across the cluster via a pandas UDF, and writes to:
+# MAGIC    - **Delta**: `ticker_news_embeddings` (embeddings as ARRAY<DOUBLE>)
+# MAGIC    - **Lakebase**: `ticker_news_embeddings` (embeddings as pgvector VECTOR)
 # MAGIC 4. Fetches the full article body for each `article_url` (via
 # MAGIC    `trafilatura`, which strips nav/ads/boilerplate from the raw HTML),
-# MAGIC    splits it into overlapping text chunks, embeds each chunk, and writes
-# MAGIC    them into a `ticker_news_chunk_embeddings` table - so RAG exercises can
-# MAGIC    retrieve fine-grained passages from article bodies, not just
-# MAGIC    title/description.
+# MAGIC    splits it into overlapping text chunks, embeds each chunk, and writes to:
+# MAGIC    - **Delta**: `ticker_news_chunk_embeddings` (ARRAY<DOUBLE>)
+# MAGIC    - **Lakebase**: `ticker_news_chunk_embeddings` (pgvector VECTOR)
 # MAGIC
-# MAGIC It re-uses the SAME Lakebase secret (scope `database`, key `lakebase-url`)
-# MAGIC that `lakebase.py` uses in the Flask app, so no extra secrets need to be
-# MAGIC created for this notebook.
+# MAGIC **Dual-write strategy** ensures:
+# MAGIC - Delta tables for Databricks-native processing and analysis
+# MAGIC - Lakebase Postgres for Flask app and external system queries
 
 # COMMAND ----------
 
-# MAGIC %pip install -q sentence-transformers trafilatura requests
+# MAGIC %pip install -q sentence-transformers trafilatura requests psycopg2-binary
 
 # COMMAND ----------
 
@@ -47,6 +50,11 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 5
+# Unity Catalog location for Delta tables
+dbutils.widgets.text("catalog", "main", "Unity Catalog catalog name")
+dbutils.widgets.text("schema", "default", "Unity Catalog schema name")
+
 dbutils.widgets.text("watchlist_table_name", "watchlist", "Source table (watchlist symbols)")
 dbutils.widgets.text("news_table_name", "ticker_news_documents", "Destination table (raw news)")
 dbutils.widgets.text("embeddings_table_name", "ticker_news_embeddings", "Destination table (vectors)")
@@ -60,10 +68,13 @@ dbutils.widgets.text("max_requests_per_minute", "5", "Massive API rate limit (fr
 dbutils.widgets.text("chunk_size", "800", "Article content chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Article content chunk overlap (chars)")
 
-WATCHLIST_TABLE_NAME = dbutils.widgets.get("watchlist_table_name")
-NEWS_TABLE_NAME = dbutils.widgets.get("news_table_name")
-EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("embeddings_table_name")
-CHUNK_EMBEDDINGS_TABLE_NAME = dbutils.widgets.get("chunk_embeddings_table_name")
+CATALOG = dbutils.widgets.get("catalog")
+SCHEMA = dbutils.widgets.get("schema")
+
+WATCHLIST_TABLE_NAME = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('watchlist_table_name')}"
+NEWS_TABLE_NAME = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('news_table_name')}"
+EMBEDDINGS_TABLE_NAME = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('embeddings_table_name')}"
+CHUNK_EMBEDDINGS_TABLE_NAME = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('chunk_embeddings_table_name')}"
 EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
 MASSIVE_SECRET_SCOPE = dbutils.widgets.get("massive_secret_scope")
 MASSIVE_SECRET_KEY = dbutils.widgets.get("massive_secret_key")
@@ -107,78 +118,97 @@ print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Resolve the Lakebase connection URL
+# MAGIC ## Setup Lakebase Connection
 # MAGIC
-# MAGIC Same secret, same decoding scheme as `lakebase.py`: a single base64-encoded
-# MAGIC Postgres URL (`postgresql://role:password@host:5432/db?sslmode=require`)
-# MAGIC stored in a Databricks secret scope. We parse it into the pieces both
-# MAGIC Spark's JDBC reader AND the raw JDBC connection helper below need
-# MAGIC (url/user/password).
+# MAGIC Data is written to both Unity Catalog Delta tables AND synced to Lakebase
+# MAGIC Postgres for external application access. The Lakebase connection uses the
+# MAGIC same secret (scope `database`, key `lakebase-url`) as the Flask app.
 
 # COMMAND ----------
 
 import base64
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse
 
 from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()
 
-
+# Get Lakebase connection details
 def get_lakebase_url() -> str:
     secret = w.secrets.get_secret(scope="database", key="lakebase-url")
     return base64.b64decode(secret.value).decode("utf-8")
 
-
 lakebase_url = get_lakebase_url()
 parsed = urlparse(lakebase_url)
 
-# Build JDBC URL without credentials
-jdbc_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
-print(f"Connecting to: {parsed.hostname}:{parsed.port or 5432}{parsed.path}")
+# Build connection string for psycopg2 (used in sync functions)
+lakebase_connection_string = lakebase_url
 
-# Pass credentials and SSL settings in properties
-jdbc_properties = {
-    "user": parsed.username,
-    "password": parsed.password,
-    "driver": "org.postgresql.Driver",
-    "sslmode": "require",
-}
-
-print(f"User: {parsed.username}")
-print(f"Database: {parsed.path}")
+print(f"Unity Catalog location: {CATALOG}.{SCHEMA}")
+print(f"Lakebase host: {parsed.hostname}:{parsed.port or 5432}")
+print(f"\nTarget Delta tables:")
+print(f"  - {WATCHLIST_TABLE_NAME}")
+print(f"  - {NEWS_TABLE_NAME}")
+print(f"  - {EMBEDDINGS_TABLE_NAME}")
+print(f"  - {CHUNK_EMBEDDINGS_TABLE_NAME}")
+print(f"\nTarget Lakebase tables:")
+print(f"  - {dbutils.widgets.get('news_table_name')}")
+print(f"  - {dbutils.widgets.get('embeddings_table_name')}")
+print(f"  - {dbutils.widgets.get('chunk_embeddings_table_name')}")
 
 # COMMAND ----------
 
 # DBTITLE 1,Test JDBC Connection
-# Test JDBC connection with embedded credentials
+# Test Delta table access
+print("Testing Delta table access...")
 try:
-    test_df = spark.read.jdbc(
-        url=jdbc_url,
-        table=WATCHLIST_TABLE_NAME,
-        properties=jdbc_properties
-    )
+    test_df = spark.table(WATCHLIST_TABLE_NAME)
     count = test_df.count()
-    print(f"✅ Connection successful! Found {count} rows in {WATCHLIST_TABLE_NAME}")
-    test_df.show(5)
+    print(f"✅ Delta: Found {count} rows in {WATCHLIST_TABLE_NAME}")
+    display(test_df.limit(5))
 except Exception as e:
-    print(f"❌ Connection failed: {e}")
+    print(f"❌ Delta access failed: {e}")
+    print(f"\nCreate the table with:")
+    print(f"CREATE TABLE {WATCHLIST_TABLE_NAME} (user_id STRING, symbol STRING, added_at TIMESTAMP);")
+
+# Test Lakebase connection
+print("\nTesting Lakebase connection...")
+try:
+    import psycopg2
+    conn = psycopg2.connect(lakebase_connection_string)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM watchlist")
+    lb_count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    print(f"✅ Lakebase: Found {lb_count} rows in watchlist")
+except Exception as e:
+    print(f"❌ Lakebase connection failed: {e}")
+    print("Make sure psycopg2 is installed: %pip install psycopg2-binary")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Database Setup Instructions
+# MAGIC ## Table Setup
 # MAGIC
-# MAGIC Before running this notebook, you must manually create the required tables
-# MAGIC in your Lakebase Postgres database:
+# MAGIC This notebook writes to **both Delta and Lakebase Postgres**.
 # MAGIC
+# MAGIC ### Delta Tables (Unity Catalog)
+# MAGIC Created automatically on first write:
+# MAGIC 1. `ticker_news_documents` - Raw news (JSON as STRING)
+# MAGIC 2. `ticker_news_embeddings` - Embeddings (ARRAY<DOUBLE>)
+# MAGIC 3. `ticker_news_chunk_embeddings` - Chunk embeddings (ARRAY<DOUBLE>)
+# MAGIC
+# MAGIC ### Lakebase Tables (Postgres)
+# MAGIC Must be created manually before running:
 # MAGIC 1. Run `sql/01_setup_news_table.sql` to create `ticker_news_documents`
+# MAGIC    (with JSONB columns for keywords and payload)
 # MAGIC 2. Run `sql/02_setup_embeddings_table.sql` to create `ticker_news_embeddings`
-# MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
+# MAGIC    (with pgvector VECTOR columns)
 # MAGIC 3. Run `sql/03_setup_chunk_embeddings_table.sql` to create `ticker_news_chunk_embeddings`
-# MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
+# MAGIC    (with pgvector VECTOR columns)
 # MAGIC
-# MAGIC This notebook uses Spark JDBC for all database operations - no psycopg2 required.
+# MAGIC Replace `{{EMBEDDING_DIM}}` in the SQL files with the model dimension (e.g., 384).
 
 # COMMAND ----------
 
@@ -215,9 +245,7 @@ def get_massive_api_key() -> str:
 def get_watchlist_tickers() -> list[str]:
     """Distinct, uppercased ticker symbols currently tracked across all users
     in the watchlist table - these are the only tickers we fetch news for."""
-    watchlist_df = spark.read.jdbc(
-        url=jdbc_url, table=WATCHLIST_TABLE_NAME, properties=jdbc_properties
-    )
+    watchlist_df = spark.table(WATCHLIST_TABLE_NAME)
     symbols = watchlist_df.select("symbol").distinct().collect()
     return [row.symbol.strip().upper() for row in symbols if row.symbol]
 
@@ -234,9 +262,80 @@ def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) ->
     return resp.json().get("results", [])
 
 
-def sync_news_to_spark(ticker: str, articles: list[dict]):
-    """Convert Massive API response to Spark DataFrame and write to Postgres.
+def sync_news_to_lakebase(ticker: str, articles: list[dict]) -> int:
+    """Sync news articles to Lakebase Postgres using psycopg2 with JSONB casting.
+    Returns count of new articles inserted."""
+    import psycopg2
+    from psycopg2.extras import execute_values
+    
+    if not articles:
+        return 0
+    
+    conn = psycopg2.connect(lakebase_connection_string)
+    cur = conn.cursor()
+    
+    # Check which IDs already exist
+    article_ids = [str(article.get("id")) for article in articles]
+    cur.execute(
+        f"SELECT id FROM {dbutils.widgets.get('news_table_name')} WHERE id = ANY(%s)",
+        (article_ids,)
+    )
+    existing_ids = {row[0] for row in cur.fetchall()}
+    
+    # Prepare rows for new articles only
+    rows = []
+    for article in articles:
+        article_id = str(article.get("id"))
+        if article_id in existing_ids:
+            continue
+            
+        sentiment = None
+        sentiment_reasoning = None
+        for insight in article.get("insights", []) or []:
+            if insight.get("ticker") == ticker:
+                sentiment = insight.get("sentiment")
+                sentiment_reasoning = insight.get("sentiment_reasoning")
+                break
+        
+        publisher = article.get("publisher") or {}
+        rows.append((
+            article_id,
+            ticker,
+            article.get("title", ""),
+            article.get("description"),
+            article.get("author"),
+            article.get("article_url"),
+            publisher.get("name"),
+            _json.dumps(article.get("keywords", [])),  # Will be cast to JSONB
+            sentiment,
+            sentiment_reasoning,
+            article.get("published_utc"),
+            _json.dumps(article),  # Will be cast to JSONB
+        ))
+    
+    if rows:
+        # Use raw SQL with explicit ::jsonb casts for keywords and payload
+        execute_values(
+            cur,
+            f"""INSERT INTO {dbutils.widgets.get('news_table_name')} 
+                (id, ticker, title, description, author, article_url, publisher_name, 
+                 keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at)
+                VALUES %s""",
+            rows,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, NOW())"
+        )
+        conn.commit()
+    
+    count = len(rows)
+    cur.close()
+    conn.close()
+    return count
+
+
+def sync_news_to_delta(ticker: str, articles: list[dict]) -> int:
+    """Convert Massive API response to Spark DataFrame and write to Delta table.
     Uses append mode with deduplication by reading existing IDs first."""
+    rows = []
     rows = []
     for article in articles:
         sentiment = None
@@ -271,30 +370,21 @@ def sync_news_to_spark(ticker: str, articles: list[dict]):
     # Create DataFrame from API response
     new_df = spark.createDataFrame(rows).withColumn("synced_at", current_timestamp())
 
-    # Read existing article IDs to avoid duplicates
-    try:
-        existing_ids = (
-            spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
-            .select("id")
-            .distinct()
-        )
+    # Read existing article IDs to avoid duplicates (only if table exists)
+    if spark.catalog.tableExists(NEWS_TABLE_NAME):
+        existing_ids = spark.table(NEWS_TABLE_NAME).select("id").distinct()
         # Filter out existing IDs
         new_df = new_df.join(existing_ids, on="id", how="left_anti")
-    except Exception:
-        # Table might be empty or not exist yet - that's fine, write all rows
-        pass
 
-    # Write new records
-    if new_df.count() > 0:
-        new_df.write.jdbc(
-            url=jdbc_url, table=NEWS_TABLE_NAME, mode="append", properties=jdbc_properties
-        )
-        return new_df.count()
-    return 0
+    # Write new records to Delta table
+    count = new_df.count()
+    if count > 0:
+        new_df.write.format("delta").mode("append").saveAsTable(NEWS_TABLE_NAME)
+    return count
 
 
-print("NOTE: Before running this cell, ensure you've run sql/01_setup_news_table.sql")
-print("      to create the ticker_news_documents table in your Lakebase database.\n")
+print(f"Fetching news for tickers in {WATCHLIST_TABLE_NAME}")
+print(f"Writing to Delta table: {NEWS_TABLE_NAME}\n")
 
 tickers = get_watchlist_tickers()
 print(f"Found {len(tickers)} distinct watchlisted tickers: {tickers}")
@@ -309,18 +399,23 @@ _massive_session.headers.update(
     {"Authorization": f"Bearer {get_massive_api_key()}", "Content-Type": "application/json"}
 )
 
-news_synced = 0
+delta_synced = 0
+lakebase_synced = 0
 for i, ticker in enumerate(tickers):
     if i > 0:
         time.sleep(_seconds_between_requests)
     try:
         articles = fetch_news_for_ticker(_massive_session, ticker, NEWS_FETCH_LIMIT)
-        news_synced += sync_news_to_spark(ticker, articles)
+        # Write to both Delta and Lakebase
+        delta_synced += sync_news_to_delta(ticker, articles)
+        lakebase_synced += sync_news_to_lakebase(ticker, articles)
     except Exception as exc:
         print(f"Skipping {ticker}: failed to fetch/sync news ({exc})")
         continue
 
-print(f"Synced {news_synced} new news articles into {NEWS_TABLE_NAME} for {len(tickers)} tickers")
+print(f"\nSync complete:")
+print(f"  Delta: {delta_synced} new articles -> {NEWS_TABLE_NAME}")
+print(f"  Lakebase: {lakebase_synced} new articles -> {dbutils.widgets.get('news_table_name')}")
 
 # COMMAND ----------
 
@@ -334,7 +429,7 @@ print(f"Synced {news_synced} new news articles into {NEWS_TABLE_NAME} for {len(t
 # COMMAND ----------
 
 news_df = (
-    spark.read.jdbc(url=jdbc_url, table=NEWS_TABLE_NAME, properties=jdbc_properties)
+    spark.table(NEWS_TABLE_NAME)
     .selectExpr(
         "id",
         "ticker",
@@ -381,9 +476,17 @@ embeddings_schema = StructType(
 def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
     """Runs once per Spark partition/task: load the model once, then embed
     every batch of rows handed to this partition."""
+    import os
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    # Set cache directory to writable location on Serverless workers
+    cache_dir = '/tmp/sentence_transformers_cache'
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ['HF_HOME'] = cache_dir
+    os.environ['TRANSFORMERS_CACHE'] = cache_dir
+    os.environ['SENTENCE_TRANSFORMERS_HOME'] = cache_dir
+    
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=cache_dir)
 
     for batch in iterator:
         vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
@@ -413,20 +516,120 @@ print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}
 
 # COMMAND ----------
 
-# Before running the cells below, ensure you've manually run:
-#   sql/02_setup_embeddings_table.sql
-# Replace {{EMBEDDING_DIM}} in that file with the value below:
-print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
-print(f"Table name: {EMBEDDINGS_TABLE_NAME}")
-print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before continuing.")
+# Embeddings will be written to Delta table with the correct dimension
+print(f"Embedding dimension: {EMBEDDING_DIM}")
+print(f"Target Delta table: {EMBEDDINGS_TABLE_NAME}")
+print("\nTable will be created automatically on first write.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Verify Lakebase Sync
+import psycopg2
+import pandas as pd
+
+print("Checking Lakebase Postgres tables...\n")
+
+conn = psycopg2.connect(lakebase_connection_string)
+cur = conn.cursor()
+
+# Check news documents table
+try:
+    cur.execute(f"SELECT COUNT(*) FROM {dbutils.widgets.get('news_table_name')}")
+    news_count = cur.fetchone()[0]
+    print(f"✅ {dbutils.widgets.get('news_table_name')}: {news_count} rows")
+    
+    cur.execute(f"""
+        SELECT ticker, COUNT(*) as article_count, MAX(synced_at) as last_sync 
+        FROM {dbutils.widgets.get('news_table_name')} 
+        GROUP BY ticker 
+        ORDER BY article_count DESC
+    """)
+    news_stats = cur.fetchall()
+    print("\nNews by ticker:")
+    for ticker, count, last_sync in news_stats:
+        print(f"  {ticker}: {count} articles (last sync: {last_sync})")
+except Exception as e:
+    print(f"❌ Error checking news table: {e}")
+
+print()
+
+# Check embeddings table
+try:
+    cur.execute(f"SELECT COUNT(*) FROM {dbutils.widgets.get('embeddings_table_name')}")
+    emb_count = cur.fetchone()[0]
+    print(f"✅ {dbutils.widgets.get('embeddings_table_name')}: {emb_count} rows")
+    
+    cur.execute(f"""
+        SELECT ticker, COUNT(*) as embedding_count, MAX(embedded_at) as last_embedded
+        FROM {dbutils.widgets.get('embeddings_table_name')}
+        GROUP BY ticker
+        ORDER BY embedding_count DESC
+    """)
+    emb_stats = cur.fetchall()
+    print("\nEmbeddings by ticker:")
+    for ticker, count, last_embedded in emb_stats:
+        print(f"  {ticker}: {count} embeddings (last embedded: {last_embedded})")
+    
+    # Sample one embedding to verify vector format (pgvector type)
+    cur.execute(f"""
+        SELECT id, ticker, title, model_name
+        FROM {dbutils.widgets.get('embeddings_table_name')}
+        LIMIT 1
+    """)
+    sample = cur.fetchone()
+    if sample:
+        print(f"\nSample embedding: id={sample[0][:20]}..., ticker={sample[1]}, model={sample[3]}")
+except Exception as e:
+    print(f"❌ Error checking embeddings table: {e}")
+    conn.rollback()  # Rollback transaction on error
+
+print()
+
+# Check chunk embeddings table
+try:
+    cur.execute(f"SELECT COUNT(*) FROM {dbutils.widgets.get('chunk_embeddings_table_name')}")
+    chunk_count = cur.fetchone()[0]
+    print(f"✅ {dbutils.widgets.get('chunk_embeddings_table_name')}: {chunk_count} rows")
+    
+    cur.execute(f"""
+        SELECT ticker, COUNT(*) as chunk_count, MAX(embedded_at) as last_embedded
+        FROM {dbutils.widgets.get('chunk_embeddings_table_name')}
+        GROUP BY ticker
+        ORDER BY chunk_count DESC
+    """)
+    chunk_stats = cur.fetchall()
+    print("\nChunk embeddings by ticker:")
+    for ticker, count, last_embedded in chunk_stats:
+        print(f"  {ticker}: {count} chunks (last embedded: {last_embedded})")
+    
+    # Sample one chunk embedding
+    cur.execute(f"""
+        SELECT id, article_id, chunk_index, model_name,
+               substring(chunk_text, 1, 50) as text_preview
+        FROM {dbutils.widgets.get('chunk_embeddings_table_name')}
+        LIMIT 1
+    """)
+    sample = cur.fetchone()
+    if sample:
+        print(f"\nSample chunk: id={sample[0]}, chunk_index={sample[2]}, model={sample[3]}")
+        print(f"  Text: {sample[4]}...")
+except Exception as e:
+    print(f"❌ Error checking chunk embeddings table: {e}")
+    conn.rollback()  # Rollback transaction on error
+
+cur.close()
+conn.close()
+
+print("\n" + "="*60)
+print("Sync verification complete!")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Upsert embeddings into Lakebase
+# MAGIC ## Write embeddings to Delta table
 # MAGIC
-# MAGIC Written in batches via JDBC's `addBatch`/`executeBatch` for throughput.
-# MAGIC Each embedding is cast to Postgres' `vector` type via `::vector`.
+# MAGIC Embeddings are written as arrays of doubles, which Delta natively supports.
+# MAGIC Deduplication is handled by checking existing IDs before writing.
 
 # COMMAND ----------
 
@@ -445,32 +648,52 @@ embeddings_final = embeddings_with_meta.withColumn(
 )
 
 # Read existing embedding IDs to avoid duplicates (deduplication strategy)
-try:
-    existing_ids = (
-        spark.read.jdbc(url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
-        .select("id")
-        .distinct()
-    )
+if spark.catalog.tableExists(EMBEDDINGS_TABLE_NAME):
+    existing_ids = spark.table(EMBEDDINGS_TABLE_NAME).select("id").distinct()
     # Filter out existing IDs (left anti-join keeps only new records)
     new_embeddings = embeddings_final.join(existing_ids, on="id", how="left_anti")
-except Exception:
-    # Table might be empty or not exist - write all embeddings
+else:
+    # Table doesn't exist yet - write all embeddings
     new_embeddings = embeddings_final
 
 embedding_count = new_embeddings.count()
 if embedding_count > 0:
-    # NOTE: Spark JDBC does not natively support pgvector VECTOR type.
-    # The embeddings are written as DOUBLE PRECISION[] arrays.
-    # You'll need to manually cast them to VECTOR in a post-processing SQL step:
-    #   UPDATE ticker_news_embeddings 
-    #   SET embedding = embedding::vector 
-    #   WHERE embedding IS NOT NULL;
-    new_embeddings.write.jdbc(
-        url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
+    # Write to Delta table - embeddings are stored as ARRAY<DOUBLE>
+    new_embeddings.write.format("delta").mode("append").saveAsTable(EMBEDDINGS_TABLE_NAME)
+    print(f"✅ Delta: Wrote {embedding_count} new embeddings to {EMBEDDINGS_TABLE_NAME}")
+    
+    # Also sync to Lakebase with pgvector format
+    import psycopg2
+    from psycopg2.extras import execute_values
+    
+    embeddings_to_sync = new_embeddings.collect()
+    conn = psycopg2.connect(lakebase_connection_string)
+    cur = conn.cursor()
+    
+    rows = [
+        (
+            row.id,
+            row.ticker,
+            row.title,
+            row.published_utc,
+            str(row.embedding),  # Will be cast to vector
+            row.model_name,
+        )
+        for row in embeddings_to_sync
+    ]
+    
+    execute_values(
+        cur,
+        f"""INSERT INTO {dbutils.widgets.get('embeddings_table_name')}
+            (id, ticker, title, published_utc, embedding, model_name, embedded_at)
+            VALUES %s""",
+        rows,
+        template="(%s, %s, %s, %s, %s::vector, %s, NOW())"
     )
-    print(f"Wrote {embedding_count} new embeddings to {EMBEDDINGS_TABLE_NAME}")
-    print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
-    print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"✅ Lakebase: Wrote {embedding_count} new embeddings to {dbutils.widgets.get('embeddings_table_name')}")
 else:
     print("No new embeddings to write (all already exist).")
 
@@ -578,9 +801,17 @@ chunk_embeddings_schema = StructType(
 def embed_chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
     """Runs once per Spark partition: load the model once, then embed
     every batch of chunks handed to this partition."""
+    import os
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    # Set cache directory to writable location on Serverless workers
+    cache_dir = '/tmp/sentence_transformers_cache'
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ['HF_HOME'] = cache_dir
+    os.environ['TRANSFORMERS_CACHE'] = cache_dir
+    os.environ['SENTENCE_TRANSFORMERS_HOME'] = cache_dir
+    
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=cache_dir)
 
     for batch in iterator:
         vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
@@ -606,17 +837,15 @@ print(f"Computed {chunk_embeddings_df.count()} chunk embeddings using {EMBEDDING
 
 # COMMAND ----------
 
-# Before running the cells below, ensure you've manually run:
-#   sql/03_setup_chunk_embeddings_table.sql
-# Replace {{EMBEDDING_DIM}} in that file with the value below:
-print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
-print(f"Table name: {CHUNK_EMBEDDINGS_TABLE_NAME}")
-print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database before continuing.")
+# Chunk embeddings will be written to Delta table with the correct dimension
+print(f"Embedding dimension: {EMBEDDING_DIM}")
+print(f"Target Delta table: {CHUNK_EMBEDDINGS_TABLE_NAME}")
+print("\nTable will be created automatically on first write.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Upsert chunk embeddings into Lakebase
+# MAGIC ## Write chunk embeddings to Delta table
 
 # COMMAND ----------
 
@@ -637,31 +866,52 @@ chunk_embeddings_final = chunk_embeddings_with_meta.withColumn(
 )
 
 # Read existing chunk embedding IDs to avoid duplicates (deduplication strategy)
-try:
-    existing_ids = (
-        spark.read.jdbc(url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
-        .select("id")
-        .distinct()
-    )
+if spark.catalog.tableExists(CHUNK_EMBEDDINGS_TABLE_NAME):
+    existing_ids = spark.table(CHUNK_EMBEDDINGS_TABLE_NAME).select("id").distinct()
     # Filter out existing IDs (left anti-join keeps only new records)
     new_chunk_embeddings = chunk_embeddings_final.join(existing_ids, on="id", how="left_anti")
-except Exception:
-    # Table might be empty or not exist - write all chunk embeddings
+else:
+    # Table doesn't exist yet - write all chunk embeddings
     new_chunk_embeddings = chunk_embeddings_final
 
 chunk_count = new_chunk_embeddings.count()
 if chunk_count > 0:
-    # NOTE: Spark JDBC does not natively support pgvector VECTOR type.
-    # The embeddings are written as DOUBLE PRECISION[] arrays.
-    # You'll need to manually cast them to VECTOR in a post-processing SQL step:
-    #   UPDATE ticker_news_chunk_embeddings 
-    #   SET embedding = embedding::vector 
-    #   WHERE embedding IS NOT NULL;
-    new_chunk_embeddings.write.jdbc(
-        url=jdbc_url, table=CHUNK_EMBEDDINGS_TABLE_NAME, mode="append", properties=jdbc_properties
+    # Write to Delta table - embeddings are stored as ARRAY<DOUBLE>
+    new_chunk_embeddings.write.format("delta").mode("append").saveAsTable(CHUNK_EMBEDDINGS_TABLE_NAME)
+    print(f"✅ Delta: Wrote {chunk_count} new chunk embeddings to {CHUNK_EMBEDDINGS_TABLE_NAME}")
+    
+    # Also sync to Lakebase with pgvector format
+    import psycopg2
+    from psycopg2.extras import execute_values
+    
+    chunks_to_sync = new_chunk_embeddings.collect()
+    conn = psycopg2.connect(lakebase_connection_string)
+    cur = conn.cursor()
+    
+    rows = [
+        (
+            row.id,
+            row.article_id,
+            row.ticker,
+            row.chunk_index,
+            row.chunk_text,
+            str(row.embedding),  # Will be cast to vector
+            row.model_name,
+        )
+        for row in chunks_to_sync
+    ]
+    
+    execute_values(
+        cur,
+        f"""INSERT INTO {dbutils.widgets.get('chunk_embeddings_table_name')}
+            (id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at)
+            VALUES %s""",
+        rows,
+        template="(%s, %s, %s, %s, %s, %s::vector, %s, NOW())"
     )
-    print(f"Wrote {chunk_count} new chunk embeddings to {CHUNK_EMBEDDINGS_TABLE_NAME}")
-    print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
-    print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector;")
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"✅ Lakebase: Wrote {chunk_count} new chunk embeddings to {dbutils.widgets.get('chunk_embeddings_table_name')}")
 else:
     print("No new chunk embeddings to write (all already exist).")
