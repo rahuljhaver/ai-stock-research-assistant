@@ -20,6 +20,13 @@ from flask import Flask, jsonify, render_template, request
 import lakebase
 from massive_client import MassiveClient
 
+from sentence_transformers import SentenceTransformer
+
+# Load once when Flask starts
+embedding_model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
 
@@ -405,6 +412,58 @@ def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
             conn.commit()
     return count
 
+@app.route("/news/search", methods=["POST"])
+def search_news():
+    """
+    Semantic search over news chunks stored in Lakebase.
+    """
+
+    if not request.is_json:
+        return jsonify({"error": "Expected JSON"}), 400
+
+    query = request.json.get("query")
+
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+
+    top_k = request.json.get("top_k", 5)
+
+    #
+    # 1. Convert question -> embedding
+    #
+    query_vector = embedding_model.encode(query).tolist()
+
+    #
+    # 2. Search pgvector
+    #
+    sql = f"""
+    SELECT
+        a.article_id,
+        b.ticker,
+        b.title,
+        b.article_url,
+        a.chunk_text,
+        embedding <=> %s::vector AS distance
+    FROM ticker_news_chunk_embeddings a left join ticker_news_documents b on a.article_id=b.id
+    ORDER BY embedding <=> %s::vector
+    LIMIT %s;
+    """
+
+    rows = lakebase.run_query(
+        sql,
+        (
+            query_vector,
+            query_vector,
+            top_k,
+        ),
+    )
+
+    return jsonify(
+        {
+            "query": query,
+            "matches": rows,
+        }
+    )
 
 if __name__ == '__main__':
     host = os.getenv('FLASK_RUN_HOST', '0.0.0.0')

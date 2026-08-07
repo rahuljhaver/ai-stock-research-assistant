@@ -156,6 +156,17 @@
   </div>
 
   <div class="card">
+    <h2 style="font-size: 18px; font-weight: 700; margin-bottom: 12px;">Semantic News Search</h2>
+    <p class="hint">Search for news articles using natural language. The search uses AI embeddings to find relevant articles.</p>
+    <form id="search-form" style="margin-top: 16px;">
+      <label for="search-query">Search Query</label>
+      <input type="text" id="search-query" name="query" placeholder="e.g., earnings reports, market trends" required>
+      <button type="submit">Search News</button>
+    </form>
+    <div id="search-results" style="margin-top: 20px;"></div>
+  </div>
+
+  <div class="card">
     <table id="watchlist-table">
       <thead>
         <tr>
@@ -264,6 +275,60 @@
     });
 
     loadWatchlist();
+
+    // News search functionality
+    const searchForm = document.getElementById("search-form");
+    const searchResults = document.getElementById("search-results");
+
+    searchForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = document.getElementById("search-query").value;
+      searchResults.innerHTML = "<p style='color: var(--muted);'>Searching...</p>";
+
+      try {
+        const resp = await fetch("/news/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, top_k: 5 }),
+        });
+        const data = await resp.json();
+        
+        if (!resp.ok) {
+          searchResults.innerHTML = `<p style='color: var(--danger);'>Error: ${data.error || resp.statusText}</p>`;
+          return;
+        }
+
+        const matches = data.matches || [];
+        if (matches.length === 0) {
+          searchResults.innerHTML = "<p style='color: var(--muted);'>No articles found.</p>";
+          return;
+        }
+
+        let html = "<div style='margin-top: 16px;'>";
+        matches.forEach((match, i) => {
+          html += `
+            <div style='padding: 16px; background: #fafbfe; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px;'>
+              <h3 style='font-size: 15px; font-weight: 600; margin: 0 0 8px 0;'>
+                ${match.title || 'Untitled'}
+              </h3>
+              <p style='font-size: 13px; color: var(--muted); margin: 4px 0;'>
+                <strong>Ticker:</strong> ${match.ticker || 'N/A'} | 
+                <strong>Distance:</strong> ${parseFloat(match.distance).toFixed(4)}
+              </p>
+              <p style='font-size: 13px; color: var(--text); margin: 8px 0;'>
+                ${match.chunk_text ? match.chunk_text.substring(0, 200) + '...' : 'No preview'}
+              </p>
+              ${match.article_url ? `<a href="${match.article_url}" target="_blank" style="font-size: 13px; color: var(--accent);">Read article →</a>` : ''}
+            </div>
+          `;
+        });
+        html += "</div>";
+        searchResults.innerHTML = html;
+
+      } catch (err) {
+        searchResults.innerHTML = `<p style='color: var(--danger);'>Request failed: ${err}</p>`;
+      }
+    });
   </script>
 </body>
 </html>

@@ -1,0 +1,6 @@
+resources:
+  apps:
+    lakebase_app:
+      name: "lakebase-app-day-2"
+      description: "Flask app for Lakebase stock watchlist and news search"
+      source_code_path: ../
