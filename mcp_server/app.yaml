@@ -1,0 +1,8 @@
+command:
+  - "python"
+  - "stock_mcp_server.py"
+
+resources:
+  - name: requirements
+    source:
+      path: ./requirements.txt
