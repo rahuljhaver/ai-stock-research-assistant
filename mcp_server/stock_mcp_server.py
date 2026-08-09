@@ -24,6 +24,11 @@ from stock_adapter import (
     get_stock_price as fetch_stock_price,
     get_latest_stock_price as fetch_latest_stock_price,
     search_stock_research_data,
+    get_watchlist as fetch_watchlist,
+    add_to_watchlist as fetch_add_to_watchlist,
+    remove_from_watchlist as fetch_remove_from_watchlist,
+    save_research_note as fetch_save_research_note,
+    save_analysis_report as fetch_save_analysis_report,
 )
 
 
@@ -116,9 +121,201 @@ def get_latest_stock_price(ticker: str):
         }
 
 @mcp.tool()
+def get_watchlist(email: str = "") -> dict:
+    """
+    Get the authenticated user's stock watchlist.
+
+    Args:
+        email: Optional user email. If not supplied, the request
+               email is used. For the demo, falls back to DEMO_USER_EMAIL.
+    """
+    try:
+        headers = _request_context.get()
+
+        forwarded_email = headers.get("x-forwarded-email")
+
+        user_email = (
+            email.strip()
+            if email
+            else forwarded_email or DEMO_USER_EMAIL
+        )
+
+        return fetch_watchlist(user_email)
+
+    except Exception as e:
+        logger.exception("Failed to retrieve watchlist")
+
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+@mcp.tool()
+def add_to_watchlist(
+    symbol: str,
+    email: str = "",
+) -> dict:
+    """
+    Add a stock to the user's watchlist.
+
+    Args:
+        symbol: Stock ticker symbol, such as "AMD".
+        email: Optional user email. If not supplied, the request
+               email is used. For the demo, falls back to DEMO_USER_EMAIL.
+    """
+    try:
+        headers = _request_context.get()
+
+        forwarded_email = headers.get("x-forwarded-email")
+
+        user_email = (
+            email.strip()
+            if email
+            else forwarded_email or DEMO_USER_EMAIL
+        )
+
+        return fetch_add_to_watchlist(
+            symbol=symbol,
+            email=user_email,
+        )
+
+    except Exception as e:
+        logger.exception("Failed to add stock to watchlist")
+
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+@mcp.tool()
+def remove_from_watchlist(
+    symbol: str,
+    email: str = "",
+) -> dict:
+    """
+    Remove a stock from the user's watchlist.
+
+    Args:
+        symbol: Stock ticker symbol.
+        email: Optional user email. If not supplied, the request
+               email is used. For the demo, falls back to DEMO_USER_EMAIL.
+    """
+    try:
+        headers = _request_context.get()
+
+        forwarded_email = headers.get("x-forwarded-email")
+
+        user_email = (
+            email.strip()
+            if email
+            else forwarded_email or DEMO_USER_EMAIL
+        )
+
+        return fetch_remove_from_watchlist(
+            symbol=symbol,
+            email=user_email,
+        )
+
+    except Exception as e:
+        logger.exception("Failed to remove stock from watchlist")
+
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+@mcp.tool()
+def save_research_note(
+    title: str,
+    note: str,
+    symbol: str = "",
+    email: str = "",
+) -> dict:
+    """
+    Save research notes for the user.
+
+    Args:
+        title: Title of the research note.
+        note: Research content.
+        symbol: Optional stock ticker.
+        email: Optional user email. If not supplied, the request
+               email is used. For the demo, falls back to DEMO_USER_EMAIL.
+    """
+    try:
+        headers = _request_context.get()
+
+        forwarded_email = headers.get("x-forwarded-email")
+
+        user_email = (
+            email.strip()
+            if email
+            else forwarded_email or DEMO_USER_EMAIL
+        )
+
+        return fetch_save_research_note(
+            title=title,
+            note=note,
+            symbol=symbol or None,
+            email=user_email,
+        )
+
+    except Exception as e:
+        logger.exception("Failed to save research note")
+
+        return {
+            "status": "error",
+            "message": str(e),
+        }         
+
+@mcp.tool()
+def save_analysis_report(
+    title: str,
+    analysis: str,
+    symbol: str = "",
+    email: str = "",
+) -> dict:
+    """
+    Save a stock analysis report for the user.
+
+    Args:
+        title: Report title.
+        analysis: Full analysis content.
+        symbol: Optional stock ticker.
+        email: Optional user email. If not supplied, the request
+               email is used. For the demo, falls back to DEMO_USER_EMAIL.
+    """
+    try:
+        headers = _request_context.get()
+
+        forwarded_email = headers.get("x-forwarded-email")
+
+        user_email = (
+            email.strip()
+            if email
+            else forwarded_email or DEMO_USER_EMAIL
+        )
+
+        return fetch_save_analysis_report(
+            title=title,
+            analysis=analysis,
+            symbol=symbol or None,
+            email=user_email,
+        )
+
+    except Exception as e:
+        logger.exception("Failed to save analysis report")
+
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+@mcp.tool()
 def search_stock_research(
     query: str,
     ticker: str = "",
+    published_after: str = "",
+    published_before: str = "",
     top_k: int = 5,
 ):
     """
@@ -127,17 +324,23 @@ def search_stock_research(
     Args:
         query: Natural-language research question.
         ticker: Optional stock ticker such as "AAPL".
+        published_after: Optional start date/time for news filtering.
+        published_before: Optional end date/time for news filtering.
         top_k: Number of relevant news chunks to return.
     """
+
     try:
         return search_stock_research_data(
             query=query,
             ticker=ticker or None,
+            published_after=published_after or None,
+            published_before=published_before or None,
             top_k=top_k,
         )
 
     except Exception as e:
         logger.exception("Stock research search failed")
+
         return {
             "status": "error",
             "message": str(e),
@@ -155,7 +358,9 @@ def get_current_user() -> dict:
 
     try:
         headers = _request_context.get()
-
+        
+        logger.info("REQUEST HEADERS: %s", headers)
+        
         forwarded_user = headers.get("x-forwarded-user")
         forwarded_email = headers.get("x-forwarded-email")
 

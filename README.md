@@ -1,34 +1,349 @@
-# Massive + Lakebase Databricks App Boilerplate
+# Stock Research AI Agent
 
-A minimal Databricks App that:
-- Connects to **Lakebase** (Databricks-managed Postgres) using a single `LAKEBASE_URL` secret (a native Postgres role with a static password)
-- Calls the **Massive API** (large paginated dataset) using a key stored in a Databricks secret scope
-- Syncs Massive API data into Lakebase in batches
-- Exposes a small Flask API to trigger syncs and read synced records
+An intelligent stock research assistant powered by Databricks Agent Framework, MCP (Model Context Protocol), and Retrieval-Augmented Generation (RAG) over financial news data.
 
-## Files
+## Overview
 
-- `app.py` - Flask app: `/healthz`, `/records` (GET), `/sync` (POST), `/watchlist` (GET/POST/DELETE), `/news/sync` (POST)
-- `lakebase.py` - Lakebase connection helper (single `LAKEBASE_URL`, psycopg2 + SQLAlchemy)
-- `massive_client.py` - Massive API client: pagination generator for large datasets, `get_latest_price`, `get_news`
-- `setup_secrets.py` - One-time script to create the secret scopes and store the Massive API key + Lakebase URL
-- `app.yaml` - Databricks App deployment config (command + env vars)
-- `templates/index.html` - Watchlist UI (add + remove tickers)
-- `notebooks/ingest_ticker_news_embeddings.py` - Self-contained ETL notebook: reads tickers from the `watchlist` table, fetches news for those tickers directly from Massive (rate-limited to 5 requests/min for the free API tier) into `ticker_news_documents`, computes title/description embeddings into `ticker_news_embeddings`, and fetches + chunks + embeds each article's full body (via `trafilatura`) into `ticker_news_chunk_embeddings` (pgvector)
-- `databricks.yml` + `resources/ingest_ticker_news_embeddings_job.yml` - Databricks Asset Bundle config that schedules the notebook above as a Workflow (see [Scheduling the embeddings notebook](#scheduling-the-embeddings-notebook-as-a-databricks-workflow))
-- `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
+The Stock Research AI Agent enables natural-language stock research through a conversational interface. Users can query real-time stock prices, search semantically through financial news, maintain personalized watchlists, and save research insights—all through simple conversational prompts.
+
+### What Problem Does It Solve?
+
+* **Information Overload**: Filters vast amounts of financial news to surface only what's relevant to your research questions
+* **Time-Consuming Research**: Automates the discovery of price catalysts by correlating news with price movements
+* **Fragmented Data**: Unifies stock prices, news articles, and user research in one conversational interface
+* **Context Loss**: Maintains research history and watchlists across sessions
+
+## Architecture
+
+The Stock Research AI Agent follows a multi-layered architecture that separates concerns between the conversational interface, tool execution, data retrieval, and storage:
+
+```
+User Query
+    ↓
+Databricks Agent (Genie)
+    ↓
+MCP Server (Tool Router)
+    ↓
+    ├─→ Stock Price API (Polygon.io via Massive Client)
+    ├─→ Lakebase Postgres
+    │   ├─→ Watchlist (user preferences)
+    │   ├─→ Research Notes (saved insights)
+    │   ├─→ Analysis Reports (completed research)
+    │   └─→ News Documents + Embeddings (RAG corpus)
+    └─→ pgvector Semantic Search
+    ↓
+Agent Response
+```
+
+### Components
+
+#### 1. Databricks Agent / Genie
+* **Role**: Conversational orchestrator
+* **Capabilities**: Understands user intent, invokes MCP tools, synthesizes responses
+* **Technology**: Databricks Agent Framework with foundation model (e.g., DBRX, Llama)
+
+#### 2. MCP Server
+* **Role**: Tool execution layer
+* **Location**: `mcp_server/stock_mcp_server.py`
+* **Technology**: FastMCP (Model Context Protocol implementation)
+* **Deployment**: Databricks App with HTTP transport
+
+#### 3. Stock Market Data API
+* **Provider**: Polygon.io (accessed via `massive_client.py`)
+* **Endpoints**:
+  * `/v2/aggs/ticker/{symbol}/prev` - Latest price
+  * `/v2/aggs/ticker/{symbol}/range/1/day/{from}/{to}` - Historical prices
+  * `/v2/reference/news` - News articles by ticker
+* **Authentication**: API key stored in Databricks secrets (`massive/api-key`)
+
+#### 4. Lakebase / Postgres
+* **Role**: Persistent storage for structured data and vector embeddings
+* **Technology**: Databricks-managed Postgres with pgvector extension
+* **Connection**: Native Postgres role with static password (stored in `database/lakebase-url` secret)
+* **Tables**:
+  * `watchlist` - User stock preferences
+  * `ticker_news_documents` - Raw news articles
+  * `ticker_news_embeddings` - Title/description embeddings (384-dim)
+  * `ticker_news_chunk_embeddings` - Article body chunk embeddings (384-dim)
+  * `research_notes` - User-saved notes
+  * `analysis_reports` - Completed analysis documents
+
+#### 5. pgvector / Vector Search
+* **Role**: Semantic similarity search over news embeddings
+* **Technology**: PostgreSQL pgvector extension with HNSW indexes
+* **Model**: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions)
+* **Distance Metric**: Cosine similarity (`<=>` operator)
+
+### End-to-End Flow
+
+#### Example: "What news could be driving AMD's price movement?"
+
+1. **User** types question in Databricks Agent interface
+2. **Agent** parses intent: needs AMD price history + relevant news
+3. **Agent** calls MCP tool `get_stock_price(ticker="AMD", days=30)`
+4. **MCP Server** → `stock_adapter.py` → `massive_client.py` → Polygon.io API
+5. **Response** returns 30 days of OHLCV data
+6. **Agent** calls MCP tool `search_stock_research(query="AMD price catalyst", ticker="AMD", top_k=5)`
+7. **MCP Server** → `stock_adapter.py`:
+   * Encodes query using `sentence-transformers/all-MiniLM-L6-v2`
+   * Executes pgvector query against `ticker_news_chunk_embeddings`
+   * Returns top 5 semantically relevant article chunks
+8. **Agent** synthesizes response correlating price movements with news events
+9. **User** sees analysis in chat
+
+## MCP Tools
+
+The MCP server (`mcp_server/stock_mcp_server.py`) exposes the following tools to the Databricks Agent:
+
+### Stock Price Tools
+
+#### `get_stock_price`
+**Purpose**: Retrieve historical daily stock prices
+
+**Inputs**:
+* `ticker` (string, required): Stock symbol (e.g., "AAPL", "MSFT")
+* `days` (int, optional): Number of calendar days to retrieve (default: 30, range: 1-365)
+
+**Returns**:
+```json
+{
+  "ticker": "AMD",
+  "from_date": "2024-01-01",
+  "to_date": "2024-01-31",
+  "record_count": 21,
+  "summary": {
+    "start_date": "2024-01-02",
+    "end_date": "2024-01-31",
+    "start_close": 145.23,
+    "end_close": 152.67,
+    "change": 7.44,
+    "change_percent": 5.12,
+    "highest_close": 155.89,
+    "lowest_close": 143.10
+  },
+  "prices": [
+    {
+      "ticker": "AMD",
+      "trade_date": "2024-01-02",
+      "open_price": 144.50,
+      "high_price": 146.78,
+      "low_price": 143.90,
+      "close_price": 145.23,
+      "volume": 52389100,
+      "vwap": 145.02
+    }
+    // ... more daily records
+  ]
+}
+```
+
+#### `get_latest_stock_price`
+**Purpose**: Retrieve the most recent traded price
+
+**Inputs**:
+* `ticker` (string, required): Stock symbol
+
+**Returns**:
+```json
+{
+  "ticker": "AMD",
+  "open_price": 152.10,
+  "high_price": 153.45,
+  "low_price": 151.80,
+  "close_price": 152.67,
+  "volume": 48920300,
+  "vwap": 152.31,
+  "timestamp": 1706745600000
+}
+```
+
+### Research Tools
+
+#### `search_stock_research`
+**Purpose**: Semantic search over financial news using pgvector
+
+**Inputs**:
+* `query` (string, required): Natural-language research question
+* `ticker` (string, optional): Filter results to specific stock symbol
+* `published_after` (string, optional): ISO date/time for filtering (e.g., "2024-01-01")
+* `published_before` (string, optional): ISO date/time for filtering
+* `top_k` (int, optional): Number of results to return (default: 5, range: 1-10)
+
+**Returns**:
+```json
+{
+  "query": "AMD data center GPU competition",
+  "ticker": "AMD",
+  "matches": [
+    {
+      "article_id": "abc123",
+      "ticker": "AMD",
+      "title": "AMD Unveils MI300 AI Accelerator...",
+      "article_url": "https://...",
+      "published_utc": "2024-01-15T14:30:00Z",
+      "chunk_text": "AMD's new MI300X GPU targets NVIDIA's dominance...",
+      "distance": 0.23
+    }
+    // ... more chunks, ordered by semantic similarity
+  ]
+}
+```
+
+### Watchlist Tools
+
+#### `get_watchlist`
+**Purpose**: Retrieve user's saved stock symbols
+
+**Inputs**:
+* `email` (string, optional): User email (auto-detected from request headers or falls back to configured email)
+
+**Returns**:
+```json
+{
+  "email": "user@example.com",
+  "count": 3,
+  "watchlist": [
+    {
+      "symbol": "AMD",
+      "email": "user@example.com",
+      "latest_price": 152.67,
+      "updated_at": "2024-01-31T18:45:00Z"
+    },
+    {"symbol": "NVDA", "email": "user@example.com", "latest_price": 505.48, "updated_at": "2024-01-31T18:45:00Z"},
+    {"symbol": "INTC", "email": "user@example.com", "latest_price": 43.21, "updated_at": "2024-01-31T18:45:00Z"}
+  ]
+}
+```
+
+#### `add_to_watchlist`
+**Purpose**: Add a stock to user's watchlist
+
+**Inputs**:
+* `symbol` (string, required): Stock ticker to add
+* `email` (string, optional): User email (auto-detected)
+
+**Returns**:
+```json
+{
+  "status": "success",
+  "message": "AMD added to watchlist.",
+  "watchlist_item": {
+    "symbol": "AMD",
+    "email": "user@example.com",
+    "latest_price": null,
+    "updated_at": "2024-01-31T19:00:00Z"
+  }
+}
+```
+
+#### `remove_from_watchlist`
+**Purpose**: Remove a stock from user's watchlist
+
+**Inputs**:
+* `symbol` (string, required): Stock ticker to remove
+* `email` (string, optional): User email (auto-detected)
+
+**Returns**:
+```json
+{
+  "status": "success",
+  "symbol": "AMD",
+  "email": "user@example.com",
+  "message": "AMD removed from watchlist."
+}
+```
+
+### Persistence Tools
+
+#### `save_research_note`
+**Purpose**: Save user research notes to Lakebase
+
+**Inputs**:
+* `title` (string, required): Note title
+* `note` (string, required): Note content
+* `symbol` (string, optional): Associated stock ticker
+* `email` (string, optional): User email (auto-detected)
+
+**Returns**:
+```json
+{
+  "status": "success",
+  "message": "Research note saved successfully.",
+  "research_note": {
+    "id": 42,
+    "email": "user@example.com",
+    "symbol": "AMD",
+    "title": "Q4 2024 Data Center Analysis",
+    "note": "AMD's MI300X ramp appears stronger than expected...",
+    "created_at": "2024-01-31T19:15:00Z"
+  }
+}
+```
+
+#### `save_analysis_report`
+**Purpose**: Save completed stock analysis
+
+**Inputs**:
+* `title` (string, required): Report title
+* `analysis` (string, required): Full analysis text
+* `symbol` (string, optional): Associated stock ticker
+* `email` (string, optional): User email (auto-detected)
+
+**Returns**:
+```json
+{
+  "status": "success",
+  "message": "Analysis report saved successfully.",
+  "analysis_report": {
+    "id": 15,
+    "email": "user@example.com",
+    "symbol": "AMD",
+    "title": "AMD 30-Day Price Catalyst Analysis",
+    "analysis": "Over the past 30 days, AMD's stock price increased 5.12%...",
+    "created_at": "2024-01-31T19:20:00Z"
+  }
+}
+```
+
+### Utility Tools
+
+#### `get_current_user`
+**Purpose**: Retrieve authenticated user information
+
+**Inputs**: None
+
+**Returns**:
+```json
+{
+  "tool_name": "get_current_user",
+  "status": "success",
+  "message": "Current user identified from request headers: user@example.com",
+  "data": {
+    "user_name": "user@example.com",
+    "forwarded_email": "user@example.com",
+    "source": "request_header"
+  }
+}
+```
 
 ## Step-by-step setup
 
-### 1. Create a Massive.com account and get an API key
+### 1. Create a Polygon.io account and get an API key
 
-1. Go to [https://massive.com](https://massive.com) and sign up for a new account (or log in if you already have one).
-2. Once logged in, open your account/workspace **Settings** (or **Developer** / **API** section, depending on Massive's current UI).
-3. Find **API Keys** and click **Create API Key** (or **Generate New Key**).
-4. Give the key a name (e.g. `databricks-app`) and copy the generated key value immediately — most providers only show it once.
-5. Keep this key handy for step 3 (Store your secrets) below. Do **not** put it in code, `.env` committed to git, or anywhere else in plaintext.
+**Note**: The codebase refers to the stock data API as "Massive API" but it uses Polygon.io endpoints.
 
-> If Massive's console differs from the steps above, look for **API Keys**, **Tokens**, or **Credentials** under your account/organization settings — the key is what authenticates requests to `https://api.massive.com` in `massive_client.py`.
+1. Go to [https://polygon.io](https://polygon.io) and sign up for a new account
+2. Navigate to your **Dashboard** after logging in
+3. Find the **API Keys** section
+4. Copy your API key (free tier provides 5 API calls/minute)
+5. Keep this key handy for step 3 (Store your secrets) below. Do **not** commit it to git or store in plaintext.
+
+**API Endpoints Used**:
+* `/v2/aggs/ticker/{symbol}/prev` - Latest price
+* `/v2/aggs/ticker/{symbol}/range/1/day/{from}/{to}` - Historical prices
+* `/v2/reference/news` - News articles
+
+**Rate Limits**: Free tier is limited to 5 requests/minute. The news ingestion notebook respects this limit.
 
 ### 2. Create a Lakebase instance and a native-password role
 
@@ -240,10 +555,294 @@ history.
 > within an enabled schema; the only way to keep a table out of the feed is to not set
 > `REPLICA IDENTITY FULL` on it.
 
+## Deployment and Running
+
+### MCP Server Deployment
+
+The MCP server is deployed as a **Databricks App** and provides the tool execution layer for the agent.
+
+**Location**: `mcp_server/`
+
+**Configuration**: `mcp_server/app.yaml`
+```yaml
+command:
+  - "python"
+  - "stock_mcp_server.py"
+
+resources:
+  - name: requirements
+    source:
+      path: ./requirements.txt
+```
+
+**Deployment Steps**:
+
+1. **Create a Git Folder** in Databricks workspace pointing to this repository
+2. **Navigate to Compute > Apps** in Databricks UI
+3. **Create App**:
+   * Name: `stock-research-mcp-server`
+   * Source: Point to `mcp_server/` directory in Git folder
+   * Databricks reads `app.yaml` automatically
+4. **Deploy**: Click Deploy in Apps UI
+5. **Get App URL**: Copy the deployed app URL (needed for Genie/Agent configuration)
+
+**Environment Variables** (auto-configured via secrets):
+* `MASSIVE_SECRET_SCOPE=massive`
+* `MASSIVE_SECRET_KEY=api-key`
+* `MASSIVE_API_BASE_URL=https://api.polygon.io` (note: code calls it "Massive" but uses Polygon.io)
+
+**Port**: Default 8000 (via `DATABRICKS_APP_PORT` or `PORT` env var)
+
+**Health Check**: `GET /mcp/health` (FastMCP standard endpoint)
+
+### Flask App (Optional)
+
+The root-level `app.py` provides a Flask web UI for:
+* Watchlist management (add/remove stocks via web form)
+* News sync triggering
+* Direct Lakebase data inspection
+
+**Not required for the Agent/MCP workflow** — the agent calls MCP tools directly, not the Flask endpoints.
+
+**To run locally**:
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+**Endpoints**:
+* `GET /` - Watchlist web UI
+* `GET /healthz` - Health check
+* `GET /watchlist` - Get current user's watchlist (JSON)
+* `POST /watchlist` - Add stock to watchlist
+* `DELETE /watchlist/<symbol>` - Remove stock
+* `POST /news/sync` - Trigger news fetch for tickers
+
+### Connecting Databricks Agent to MCP Server
+
+1. **Deploy MCP Server** as Databricks App (steps above)
+2. **Copy App URL** (e.g., `https://<workspace>.cloud.databricks.com/apps/<app-id>`)
+3. **Configure Genie Space** or **Agent Bricks Agent**:
+   * Add MCP server URL to agent configuration
+   * Agent Framework auto-discovers tools via MCP introspection
+4. **Test**: Ask agent "Show me my watchlist" — agent should call MCP `get_watchlist` tool
+
+### Database Setup
+
+Before running news ingestion, manually create tables in Lakebase:
+
+1. **Connect to Lakebase** using the connection URL from Step 2 (setup secrets)
+2. **Run SQL scripts** in `sql/` directory in order:
+   * `01_setup_news_table.sql` - Creates `ticker_news_documents`
+   * `02_setup_embeddings_table.sql` - Creates `ticker_news_embeddings` (replace `{{EMBEDDING_DIM}}` with `384`)
+   * `03_setup_chunk_embeddings_table.sql` - Creates `ticker_news_chunk_embeddings` (replace `{{EMBEDDING_DIM}}` with `384`)
+   * `05_setup_research_tables.sql` - Creates `research_notes` and `analysis_reports`
+
+**Watchlist table** is auto-created by `app.py` on first run.
+
+**Why manual setup?** 
+* Spark JDBC cannot execute `CREATE EXTENSION vector` or `CREATE INDEX USING hnsw`
+* Spark cannot write directly to pgvector `VECTOR` type
+* Manual setup ensures proper indexing for semantic search performance
+
+### News Ingestion ETL
+
+**Notebook**: `notebooks/ingest_ticker_news_embeddings.py`
+
+**Scheduling Options**:
+
+#### Option A: Databricks Asset Bundle (CLI)
+```bash
+# Edit databricks.yml: set workspace URL
+databricks bundle deploy -t dev
+databricks bundle run ingest_ticker_news_embeddings_job -t dev
+
+# To enable daily schedule: change pause_status to UNPAUSED in resources/ingest_ticker_news_embeddings_job.yml
+```
+
+#### Option B: Workflows UI (No CLI)
+1. Go to **Workflows > Jobs > Create Job**
+2. Add notebook task: `notebooks/ingest_ticker_news_embeddings.py`
+3. Set parameters (see notebook for required widget values)
+4. Add trigger: Daily schedule (e.g., 6 AM UTC)
+5. Save and run
+
+**What it does**:
+* Reads tickers from `watchlist` table
+* Fetches news per ticker from Polygon.io (rate-limited: 5 req/min)
+* Stores articles in `ticker_news_documents`
+* Generates embeddings:
+  * Title + description → `ticker_news_embeddings`
+  * Article body chunks → `ticker_news_chunk_embeddings`
+* Uses `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions)
+
+**Post-processing** (after first run):
+```sql
+-- Convert arrays to pgvector type
+UPDATE ticker_news_embeddings 
+SET embedding = embedding::vector 
+WHERE embedding IS NOT NULL;
+
+UPDATE ticker_news_chunk_embeddings 
+SET embedding = embedding::vector 
+WHERE embedding IS NOT NULL;
+```
+
+## Known Limitations
+
+### User Identity in MCP Requests
+
+**Issue**: The current MCP request environment does not include `X-Forwarded-User` or `X-Forwarded-Email` headers.
+
+**Impact**: 
+* MCP tools that require user identification (`get_watchlist`, `add_to_watchlist`, `remove_from_watchlist`, `save_research_note`, `save_analysis_report`) cannot automatically determine the calling user
+* The code references a `DEMO_USER_EMAIL` fallback variable, but this variable is **not defined** in `stock_mcp_server.py`
+
+**Current Behavior**:
+* If `email` parameter is explicitly passed to the tool, that email is used
+* If `X-Forwarded-Email` header is present, that email is used (currently not present)
+* Otherwise, code attempts to fall back to `DEMO_USER_EMAIL` (undefined, will raise `NameError`)
+
+**Workaround**:
+* For testing: Pass `email` parameter explicitly in tool calls
+* For production: Define `DEMO_USER_EMAIL` environment variable in MCP server deployment, or fix authentication header forwarding in the Databricks App/MCP integration
+
+**Code Location**: `mcp_server/stock_mcp_server.py` lines 140, 174, 211, 252, 295
+
+### API Rate Limits
+
+**Polygon.io Free Tier**: 5 API calls per minute
+
+**Mitigations**:
+* News ingestion notebook includes configurable rate limiting (`max_requests_per_minute` parameter, default: 5)
+* ETL runs once daily (scheduled), not on-demand
+* Historical price queries count against rate limit — use sparingly in testing
+
+### Embedding Model on Serverless
+
+**Current**: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, CPU-friendly)
+
+**Limitation**: Model loads on every MCP tool invocation; no persistent embedding service
+
+**Impact**: `search_stock_research` has ~500ms+ cold-start latency on first query
+
+**Future Enhancement**: Deploy embedding model as Model Serving endpoint for sub-100ms inference
+
+### Vector Search Scope
+
+**Current**: pgvector with HNSW index in Lakebase Postgres
+
+**Limitations**:
+* No cross-ticker semantic search UI (must specify ticker or search all)
+* No reranking or hybrid search (keyword + semantic)
+* No query expansion or multi-vector retrieval
+
+**Performance**: HNSW index provides sub-50ms retrieval for top-k queries (k ≤ 10) on datasets up to ~100K chunks
+
+## Project Status
+
+### ✅ Completed Capabilities
+
+* **MCP Server Deployment**
+  * FastMCP server running as Databricks App
+  * HTTP transport with health check endpoint
+  * 9 tools exposed to Databricks Agent
+
+* **Stock Price Retrieval**
+  * Historical daily prices (OHLCV + VWAP)
+  * Latest price lookup
+  * Price summary statistics (change, % change, highs/lows)
+  * Integration with Polygon.io API
+
+* **Semantic News Search**
+  * News ingestion from Polygon.io
+  * Article chunking with overlap
+  * Embedding generation (`sentence-transformers/all-MiniLM-L6-v2`)
+  * pgvector storage with HNSW indexing
+  * Cosine similarity search
+  * Filtering by ticker and date range
+
+* **Watchlist Management**
+  * Per-user watchlist in Lakebase
+  * Add/remove stocks
+  * List watchlist with last known prices
+  * Integration with news ETL (fetches news for watchlist tickers only)
+
+* **Research Persistence**
+  * Save research notes with optional ticker association
+  * Save completed analysis reports
+  * Timestamped records per user
+
+* **ETL Pipeline**
+  * Automated news ingestion notebook
+  * Rate-limited API calls (respects free tier)
+  * Incremental updates (deduplication via article ID)
+  * Article body extraction (trafilatura)
+  * Scheduled execution via Databricks Workflows
+
+* **Database Layer**
+  * Lakebase Postgres with pgvector extension
+  * 6 tables: watchlist, news documents, embeddings (2 tables), research notes, analysis reports
+  * HNSW indexes for vector search
+  * Native password authentication (static credentials)
+
+* **Agent Integration**
+  * Tools discoverable via MCP introspection
+  * Conversational interface via Databricks Agent Framework
+  * Multi-step reasoning (price + news correlation)
+  * Natural language → SQL/API → synthesis
+
+### 🚧 Known Issues
+
+* **User identity**: `X-Forwarded-Email` header not present in MCP requests; `DEMO_USER_EMAIL` fallback undefined
+* **Cold start latency**: Embedding model loads on every MCP server invocation (~500ms)
+* **No cross-ticker search UI**: Agent must specify ticker or search all news (no smart scoping)
+
+### 📋 Future Enhancements
+
+* **Model Serving**: Deploy embedding model as Databricks Model Serving endpoint
+* **Reranking**: Add semantic reranker for improved top-k precision
+* **Hybrid Search**: Combine keyword (BM25) + semantic for better recall
+* **Streaming ETL**: Real-time news ingestion via Polygon.io WebSocket
+* **Multi-modal**: Image analysis for charts in financial documents
+* **Portfolio Tracking**: Track positions, cost basis, P&L
+* **Backtesting**: Historical "what would the agent have recommended?" analysis
+
+## Repository Structure
+
+```
+ai-stock-research-assistant/
+├── mcp_server/                    # MCP server (Databricks App)
+│   ├── stock_mcp_server.py        # FastMCP tool definitions
+│   ├── stock_adapter.py           # Tool implementation (DB + API calls)
+│   ├── massive_client.py          # Polygon.io API client
+│   ├── app.yaml                   # Databricks App config
+│   └── requirements.txt
+├── notebooks/
+│   ├── ingest_ticker_news_embeddings.py   # ETL: news → embeddings
+│   └── ingest_stock_price_history.py      # ETL: historical prices
+├── sql/                           # Lakebase table DDL
+│   ├── 01_setup_news_table.sql
+│   ├── 02_setup_embeddings_table.sql
+│   ├── 03_setup_chunk_embeddings_table.sql
+│   ├── 04_cast_arrays_to_vectors.sql
+│   ├── 05_setup_research_tables.sql
+│   └── README.md
+├── app.py                         # Flask app (optional web UI)
+├── lakebase.py                    # Lakebase connection helper
+├── massive_client.py              # Polygon.io client (root-level copy)
+├── setup_secrets.py               # One-time secret configuration
+├── app.yaml                       # Flask app Databricks App config
+├── databricks.yml                 # Databricks Asset Bundle config
+├── resources/
+│   └── ingest_ticker_news_embeddings_job.yml
+├── requirements.txt
+└── README.md                      # This file
+```
+
 ## Notes
 
-- Lakebase auth uses a single `LAKEBASE_URL` secret pointing at a native Postgres role with a
-  static, non-expiring password — no token refresh logic needed in `lakebase.py`.
-- The Massive API pagination in `massive_client.py` assumes a `{"items": [...], "next_cursor": ...}`
-  cursor-based shape. Adjust `paginated_get` to match the real API's pagination contract.
+- Lakebase auth uses a single `LAKEBASE_URL` secret pointing at a native Postgres role with a static, non-expiring password — no token refresh logic needed.
+- The codebase refers to the stock data API as "Massive API" but actually uses Polygon.io endpoints (historical naming artifact).
 - For very large batch upserts, consider `psycopg2.extras.execute_values` instead of per-row inserts.
+- The Flask app (`app.py`) and MCP server (`mcp_server/stock_mcp_server.py`) are separate deployments — agents call MCP tools, not Flask endpoints.
