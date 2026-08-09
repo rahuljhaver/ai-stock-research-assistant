@@ -85,6 +85,29 @@ class MassiveClient:
         """
         data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
         return data
+    
+    def get_historical_prices(
+        self,
+        symbol: str,
+        from_date: str,
+        to_date: str,
+    ) -> list[dict]:
+        """
+        Fetch daily historical aggregate prices for a single ticker.
+
+        from_date and to_date should be YYYY-MM-DD.
+        Returns the API results list.
+        """
+        data = self.get(
+            f"/v2/aggs/ticker/{symbol}/range/1/day/{from_date}/{to_date}",
+            params={
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 5000,
+            },
+        )
+
+        return data.get("results", [])
 
     def get_news(
         self,

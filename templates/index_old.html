@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Massive Stock Watchlist</title>
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card-bg: #ffffff;
+      --border: #e4e7ee;
+      --text: #1f2430;
+      --muted: #6b7280;
+      --accent: #4f46e5;
+      --accent-hover: #4338ca;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      max-width: 640px;
+      margin: 48px auto;
+      padding: 0 20px;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    h1 {
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 4px;
+      line-height: 1.5;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-top: 24px;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, 0.04);
+    }
+
+    label {
+      display: block;
+      margin-top: 16px;
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text);
+    }
+    label:first-child { margin-top: 0; }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      margin-top: 6px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.15s ease;
+    }
+    input[type="text"]:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+    }
+
+    button {
+      margin-top: 18px;
+      padding: 10px 18px;
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      transition: background 0.15s ease;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:active { transform: translateY(1px); }
+
+    #result {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      background: #f6f6f6;
+      padding: 12px 14px;
+      border-radius: 8px;
+      min-height: 20px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    #result:empty { display: none; }
+
+    table {
+      width: 100%;
+      margin-top: 0;
+      border-collapse: collapse;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+    }
+    th {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      font-weight: 600;
+    }
+    tbody tr:hover { background: #fafbfe; }
+    tbody tr:last-child td { border-bottom: none; }
+
+    .empty-row td {
+      color: var(--muted);
+      text-align: center;
+      padding: 20px 8px;
+    }
+
+    .delete-btn {
+      margin-top: 0;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid var(--danger);
+    }
+    .delete-btn:hover { background: var(--danger); color: #fff; }
+    .delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .ticker-link {
+      color: var(--accent);
+      cursor: pointer;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .ticker-link:hover { text-decoration: underline; }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin: 16px 0;
+    }
+    .metric {
+      background: #fafbfe;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .metric-label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      font-weight: 600;
+    }
+    .metric-value {
+      font-size: 18px;
+      font-weight: 700;
+      margin-top: 4px;
+      color: var(--text);
+    }
+    .metric-value.positive { color: #059669; }
+    .metric-value.negative { color: var(--danger); }
+
+    #stock-chart {
+      width: 100%;
+      height: 300px;
+      margin-top: 16px;
+    }
+
+    #stock-dashboard { display: none; }
+    #stock-dashboard.visible { display: block; }
+  </style>
+</head>
+<body>
+  <h1>Stock Watchlist</h1>
+  <p class="hint">Enter a single ticker symbol. This sends exactly ONE call to the Massive API to fetch the latest price, then adds it to your watchlist.</p>
+
+  <div class="card">
+    <form id="stock-form">
+      <label for="symbol">Ticker symbol</label>
+      <input type="text" id="symbol" name="symbol" placeholder="AAPL" required>
+      <button type="submit">Add to watchlist</button>
+    </form>
+
+    <div id="result"></div>
+  </div>
+
+  <div class="card" id="stock-dashboard">
+    <h2 style="font-size: 18px; font-weight: 700; margin-bottom: 12px;">Stock Research</h2>
+    <p class="hint" id="stock-hint">Click a ticker symbol in your watchlist below to view historical data.</p>
+    
+    <div id="stock-content" style="display: none;">
+      <h3 style="font-size: 16px; font-weight: 700; margin: 16px 0 8px 0;" id="selected-ticker"></h3>
+      
+      <div class="metric-grid">
+        <div class="metric">
+          <div class="metric-label">Latest Close</div>
+          <div class="metric-value" id="latest-close">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Latest Date</div>
+          <div class="metric-value" id="latest-date" style="font-size: 14px;">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Previous Close</div>
+          <div class="metric-value" id="previous-close">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Change</div>
+          <div class="metric-value" id="price-change">-</div>
+        </div>
+      </div>
+
+      <div style="margin-top: 16px;">
+        <div class="metric-label" style="margin-bottom: 8px;">Historical Closing Price</div>
+        <p class="hint" id="date-range" style="margin-top: 4px; margin-bottom: 8px;"></p>
+        <canvas id="stock-chart"></canvas>
+      </div>
+    </div>
+
+    <div id="stock-error" style="display: none; color: var(--danger); margin-top: 16px;"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size: 18px; font-weight: 700; margin-bottom: 12px;">Semantic News Search</h2>
+    <p class="hint">Search for news articles using natural language. The search uses AI embeddings to find relevant articles.</p>
+    <form id="search-form" style="margin-top: 16px;">
+      <label for="search-query">Search Query</label>
+      <input type="text" id="search-query" name="query" placeholder="e.g., earnings reports, market trends" required>
+      <button type="submit">Search News</button>
+    </form>
+    <div id="search-results" style="margin-top: 20px;"></div>
+  </div>
+
+  <div class="card">
+    <table id="watchlist-table">
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Email</th>
+          <th>Latest price</th>
+          <th>Updated</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="watchlist-body"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const form = document.getElementById("stock-form");
+    const resultEl = document.getElementById("result");
+    const watchlistBody = document.getElementById("watchlist-body");
+
+    async function loadWatchlist() {
+      try {
+        const resp = await fetch("/watchlist");
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error loading watchlist: " + (data.error || resp.statusText);
+          return;
+        }
+        watchlistBody.innerHTML = "";
+
+        if (!data.length) {
+          const emptyTr = document.createElement("tr");
+          emptyTr.className = "empty-row";
+          emptyTr.innerHTML = `<td colspan="5">Your watchlist is empty. Add a ticker above to get started.</td>`;
+          watchlistBody.appendChild(emptyTr);
+          return;
+        }
+
+        data.forEach((row) => {
+          const tr = document.createElement("tr");
+          const price = row.latest_price !== null && row.latest_price !== undefined
+            ? Number(row.latest_price).toFixed(2)
+            : "-";
+          const updated = row.updated_at ? new Date(row.updated_at).toLocaleString() : "-";
+          tr.innerHTML = `
+            <td><a class="ticker-link" data-symbol="${row.symbol}">${row.symbol}</a></td>
+            <td>${row.email || "-"}</td>
+            <td>${price}</td>
+            <td>${updated}</td>
+            <td><button type="button" class="delete-btn" data-symbol="${row.symbol}">Remove</button></td>
+          `;
+          watchlistBody.appendChild(tr);
+        });
+      } catch (err) {
+        resultEl.textContent = "Failed to load watchlist: " + err;
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const symbol = document.getElementById("symbol").value;
+      resultEl.textContent = "Adding to watchlist...";
+
+      try {
+        const resp = await fetch("/watchlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          return;
+        }
+        resultEl.textContent = "Added " + data.symbol + " at price " + data.latest_price;
+        document.getElementById("symbol").value = "";
+        loadWatchlist();
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+      }
+    });
+
+    watchlistBody.addEventListener("click", async (e) => {
+      const btn = e.target.closest(".delete-btn");
+      if (!btn) return;
+
+      const symbol = btn.dataset.symbol;
+      btn.disabled = true;
+      resultEl.textContent = "Removing " + symbol + "...";
+
+      try {
+        const resp = await fetch(`/watchlist/${encodeURIComponent(symbol)}`, {
+          method: "DELETE",
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          btn.disabled = false;
+          return;
+        }
+        resultEl.textContent = "Removed " + data.symbol + " from your watchlist.";
+        loadWatchlist();
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+        btn.disabled = false;
+      }
+    });
+
+    loadWatchlist();
+
+    // Stock history functionality
+    function drawChart(canvas, labels, values) {
+      console.log("CHART DEBUG - drawChart called");
+      console.log("CHART DEBUG - labels length:", labels.length);
+      console.log("CHART DEBUG - values:", values);
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width = canvas.offsetWidth * 2;
+      const height = canvas.height = 600;
+      const padding = 60;
+      
+      // Clear canvas
+      ctx.clearRect(0, 0, width, height);
+      
+      // Find min and max values
+      const minVal = Math.min(...values);
+      const maxVal = Math.max(...values);
+      const range = maxVal - minVal;
+      const buffer = range * 0.1;
+      
+      const chartWidth = width - 2 * padding;
+      const chartHeight = height - 2 * padding;
+      
+      // Draw axes
+      ctx.strokeStyle = '#e4e7ee';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(padding, padding);
+      ctx.lineTo(padding, height - padding);
+      ctx.lineTo(width - padding, height - padding);
+      ctx.stroke();
+      
+      // Draw horizontal grid lines and Y-axis labels
+      ctx.strokeStyle = '#f0f0f0';
+      ctx.lineWidth = 1;
+      ctx.fillStyle = '#6b7280';
+      ctx.font = '22px sans-serif';
+      ctx.textAlign = 'right';
+      
+      const numYTicks = 5;
+      for (let i = 0; i <= numYTicks; i++) {
+        const y = padding + (chartHeight * i / numYTicks);
+        const value = maxVal + buffer - ((maxVal - minVal + 2 * buffer) * i / numYTicks);
+        
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+        
+        ctx.fillText('$' + value.toFixed(2), padding - 10, y + 8);
+      }
+      
+      // Draw X-axis labels (show every nth label to avoid crowding)
+      ctx.textAlign = 'center';
+      const labelStep = Math.max(1, Math.floor(labels.length / 8));
+      for (let i = 0; i < labels.length; i += labelStep) {
+        const x = padding + (chartWidth * i / (labels.length - 1));
+        ctx.fillText(labels[i], x, height - padding + 30);
+      }
+      
+      // Draw line
+      ctx.strokeStyle = '#4f46e5';
+      ctx.lineWidth = 4;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      
+      for (let i = 0; i < values.length; i++) {
+        const x = padding + (chartWidth * i / (values.length - 1));
+        const normalizedValue = (values[i] - minVal + buffer) / (maxVal - minVal + 2 * buffer);
+        const y = height - padding - (chartHeight * normalizedValue);
+        
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+      
+      // Draw dots
+      ctx.fillStyle = '#4f46e5';
+      for (let i = 0; i < values.length; i++) {
+        const x = padding + (chartWidth * i / (values.length - 1));
+        const normalizedValue = (values[i] - minVal + buffer) / (maxVal - minVal + 2 * buffer);
+        const y = height - padding - (chartHeight * normalizedValue);
+        
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
+
+    async function loadStockHistory(ticker) {
+      const dashboard = document.getElementById('stock-dashboard');
+      const content = document.getElementById('stock-content');
+      const hint = document.getElementById('stock-hint');
+      const errorEl = document.getElementById('stock-error');
+
+      dashboard.classList.add('visible');
+      content.style.display = 'none';
+      hint.style.display = 'block';
+      errorEl.style.display = 'none';
+      hint.textContent = `Loading ${ticker} historical data...`;
+
+      try {
+        const resp = await fetch(`/stocks/${encodeURIComponent(ticker)}/history`);
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          throw new Error(data.error || resp.statusText);
+        }
+
+        const prices = data.prices || [];
+        if (prices.length === 0) {
+          errorEl.textContent = `No historical data available for ${ticker}`;
+          errorEl.style.display = 'block';
+          hint.style.display = 'none';
+          return;
+        }
+
+        // Calculate metrics
+        const latestPrice = prices[prices.length - 1];
+        const previousPrice = prices.length > 1 ? prices[prices.length - 2] : null;
+        
+        const latestClose = latestPrice.close_price;
+        const latestDate = latestPrice.trade_date;
+        const previousClose = previousPrice ? previousPrice.close_price : null;
+        
+        let priceChange = null;
+        let percentChange = null;
+        if (previousClose !== null) {
+          priceChange = latestClose - previousClose;
+          percentChange = (priceChange / previousClose) * 100;
+        }
+
+        // Update UI
+        document.getElementById('selected-ticker').textContent = ticker;
+        document.getElementById('latest-close').textContent = '$' + Number(latestClose).toFixed(2);
+        document.getElementById('latest-date').textContent = latestDate;
+        document.getElementById('previous-close').textContent = previousClose !== null ? '$' + Number(previousClose).toFixed(2) : '-';
+        
+        const changeEl = document.getElementById('price-change');
+        if (priceChange !== null) {
+          const sign = priceChange >= 0 ? '+' : '';
+          changeEl.textContent = `${sign}$${priceChange.toFixed(2)} (${sign}${percentChange.toFixed(2)}%)`;
+          changeEl.className = 'metric-value ' + (priceChange >= 0 ? 'positive' : 'negative');
+        } else {
+          changeEl.textContent = '-';
+          changeEl.className = 'metric-value';
+        }
+
+        // Date range
+        const firstDate = prices[0].trade_date;
+        const lastDate = prices[prices.length - 1].trade_date;
+        document.getElementById('date-range').textContent = `Data range: ${firstDate} to ${lastDate} (${prices.length} trading days)`;
+
+        // Draw chart
+        const labels = prices.map(p => p.trade_date);
+        const closePrices = prices.map(p => p.close_price);
+        const canvas = document.getElementById('stock-chart');
+        console.log("STOCK DEBUG - prices:", prices);
+        console.log("STOCK DEBUG - labels:", labels);
+        console.log("STOCK DEBUG - closePrices:", closePrices);
+        console.log("STOCK DEBUG - canvas:", canvas);
+        console.log("STOCK DEBUG - canvas offsetWidth:", canvas.offsetWidth);
+        console.log("STOCK DEBUG - canvas offsetHeight:", canvas.offsetHeight);
+        
+        // Show content BEFORE drawing chart so canvas has proper dimensions
+        hint.style.display = 'none';
+        content.style.display = 'block';
+        
+        drawChart(canvas, labels, closePrices);
+
+      } catch (err) {
+        errorEl.textContent = `Failed to load ${ticker} data: ${err.message}`;
+        errorEl.style.display = 'block';
+        hint.style.display = 'none';
+      }
+    }
+
+    // Handle ticker clicks
+    watchlistBody.addEventListener('click', async (e) => {
+      const tickerLink = e.target.closest('.ticker-link');
+      if (tickerLink) {
+        e.preventDefault();
+        const symbol = tickerLink.dataset.symbol;
+        loadStockHistory(symbol);
+        return;
+      }
+      
+      // Delete button handler stays in the original event listener below
+    });
+
+    // News search functionality
+    const searchForm = document.getElementById("search-form");
+    const searchResults = document.getElementById("search-results");
+
+    searchForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = document.getElementById("search-query").value;
+      searchResults.innerHTML = "<p style='color: var(--muted);'>Searching...</p>";
+
+      try {
+        const resp = await fetch("/news/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, top_k: 5 }),
+        });
+        const data = await resp.json();
+        
+        if (!resp.ok) {
+          searchResults.innerHTML = `<p style='color: var(--danger);'>Error: ${data.error || resp.statusText}</p>`;
+          return;
+        }
+
+        const matches = data.matches || [];
+        if (matches.length === 0) {
+          searchResults.innerHTML = "<p style='color: var(--muted);'>No articles found.</p>";
+          return;
+        }
+
+        let html = "<div style='margin-top: 16px;'>";
+        matches.forEach((match, i) => {
+          html += `
+            <div style='padding: 16px; background: #fafbfe; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px;'>
+              <h3 style='font-size: 15px; font-weight: 600; margin: 0 0 8px 0;'>
+                ${match.title || 'Untitled'}
+              </h3>
+              <p style='font-size: 13px; color: var(--muted); margin: 4px 0;'>
+                <strong>Ticker:</strong> ${match.ticker || 'N/A'} | 
+                <strong>Distance:</strong> ${parseFloat(match.distance).toFixed(4)}
+              </p>
+              <p style='font-size: 13px; color: var(--text); margin: 8px 0;'>
+                ${match.chunk_text ? match.chunk_text.substring(0, 200) + '...' : 'No preview'}
+              </p>
+              ${match.article_url ? `<a href="${match.article_url}" target="_blank" style="font-size: 13px; color: var(--accent);">Read article →</a>` : ''}
+            </div>
+          `;
+        });
+        html += "</div>";
+        searchResults.innerHTML = html;
+
+      } catch (err) {
+        searchResults.innerHTML = `<p style='color: var(--danger);'>Request failed: ${err}</p>`;
+      }
+    });
+  </script>
+</body>
+</html>

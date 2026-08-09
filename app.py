@@ -271,6 +271,47 @@ def add_to_watchlist():
 
     return jsonify({"symbol": symbol, "email": email, "latest_price": price})
 
+@app.route("/stocks/<symbol>/massive-history", methods=["GET"])
+def get_massive_stock_history(symbol: str):
+    """
+    Return historical daily price data for a stock.
+    """
+    symbol = symbol.strip().upper()
+
+    if not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol}"}), 400
+
+    from_date = request.args.get("from")
+    to_date = request.args.get("to")
+
+    if not from_date or not to_date:
+        return jsonify({
+            "error": "Both 'from' and 'to' dates are required. "
+                     "Use YYYY-MM-DD format."
+        }), 400
+
+    client = MassiveClient()
+
+    try:
+        prices = client.get_historical_prices(
+            symbol,
+            from_date,
+            to_date,
+        )
+    except requests.HTTPError as exc:
+        logger.exception("Failed to retrieve historical prices")
+        return jsonify({
+            "error": f"Unable to retrieve historical prices for {symbol}"
+        }), 400
+
+    return jsonify({
+        "symbol": symbol,
+        "from": from_date,
+        "to": to_date,
+        "count": len(prices),
+        "prices": prices,
+    })
+
 
 @app.route("/watchlist/<symbol>", methods=["DELETE"])
 def delete_from_watchlist(symbol: str):
@@ -464,6 +505,39 @@ def search_news():
             "matches": rows,
         }
     )
+
+@app.route("/stocks/<ticker>/history", methods=["GET"])
+def get_stock_history(ticker):
+    """
+    Retrieve historical stock prices from Lakebase.
+    """
+
+    sql = """
+    SELECT
+        ticker,
+        trade_date,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume,
+        vwap
+    FROM stock_price_history
+    WHERE ticker = %s
+    ORDER BY trade_date ASC;
+    """
+
+    rows = lakebase.run_query(
+        sql,
+        (ticker.upper(),),
+    )
+
+    return jsonify(
+        {
+            "ticker": ticker.upper(),
+            "prices": rows,
+        }
+    )    
 
 if __name__ == '__main__':
     host = os.getenv('FLASK_RUN_HOST', '0.0.0.0')

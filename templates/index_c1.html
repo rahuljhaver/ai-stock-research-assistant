@@ -788,19 +788,6 @@
     lastChartData = null;
   }
 
-  const AXIS_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-  function formatAxisDate(dateStr) {
-    // Parse "YYYY-MM-DD" manually — new Date(str) can shift a day depending
-    // on the browser's local timezone, which is wrong for trade dates.
-    const parts = String(dateStr).split("-");
-    if (parts.length !== 3) return dateStr;
-    const monthIdx = parseInt(parts[1], 10) - 1;
-    const day = parseInt(parts[2], 10);
-    const month = AXIS_MONTHS[monthIdx];
-    return month ? `${month} ${day}` : dateStr;
-  }
-
   function drawChart(canvas, labels, values, direction) {
     const dpr = window.devicePixelRatio || 1;
     const cssWidth = canvas.parentElement.clientWidth;
@@ -853,25 +840,12 @@
       ctx.fillText("$" + v.toFixed(2), padding.left - 10, y);
     }
 
-    // X-axis labels — spaced dynamically so dates never collide, however
-    // many trading days are in range.
+    // X-axis labels
+    ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    const shortLabels = labels.map(formatAxisDate);
-    const sampleWidth = Math.max(...shortLabels.map((l) => ctx.measureText(l).width));
-    const minGap = 16; // px breathing room between adjacent labels
-    const maxLabels = Math.max(1, Math.floor(chartWidth / (sampleWidth + minGap)));
-    const labelStep = Math.max(1, Math.ceil(labels.length / maxLabels));
-
-    const lastIdx = labels.length - 1;
-    for (let i = 0; i <= lastIdx; i += labelStep) {
-      // Skip a label if it would land too close to the final one we always draw.
-      if (i !== 0 && lastIdx - i < labelStep / 2 && i !== lastIdx) continue;
-      ctx.textAlign = i === 0 ? "left" : i === lastIdx ? "right" : "center";
-      ctx.fillText(shortLabels[i], xFor(i), height - padding.bottom + 8);
-    }
-    if ((lastIdx) % labelStep !== 0) {
-      ctx.textAlign = "right";
-      ctx.fillText(shortLabels[lastIdx], xFor(lastIdx), height - padding.bottom + 8);
+    const labelStep = Math.max(1, Math.floor(labels.length / 6));
+    for (let i = 0; i < labels.length; i += labelStep) {
+      ctx.fillText(labels[i], xFor(i), height - padding.bottom + 8);
     }
 
     // Area fill under the line
