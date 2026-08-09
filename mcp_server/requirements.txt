@@ -2,4 +2,5 @@ databricks-sdk>=0.30.0
 fastmcp>=3.2.0
 requests>=2.31.0
 typing_extensions>=4.6.0
-
+sentence-transformers>=3.0.0
+psycopg2-binary>=2.9.9

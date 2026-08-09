@@ -23,6 +23,7 @@ from starlette.requests import Request
 from stock_adapter import (
     get_stock_price as fetch_stock_price,
     get_latest_stock_price as fetch_latest_stock_price,
+    search_stock_research_data,
 )
 
 
@@ -114,6 +115,33 @@ def get_latest_stock_price(ticker: str):
             "message": str(e),
         }
 
+@mcp.tool()
+def search_stock_research(
+    query: str,
+    ticker: str = "",
+    top_k: int = 5,
+):
+    """
+    Search stock-related news using semantic similarity.
+
+    Args:
+        query: Natural-language research question.
+        ticker: Optional stock ticker such as "AAPL".
+        top_k: Number of relevant news chunks to return.
+    """
+    try:
+        return search_stock_research_data(
+            query=query,
+            ticker=ticker or None,
+            top_k=top_k,
+        )
+
+    except Exception as e:
+        logger.exception("Stock research search failed")
+        return {
+            "status": "error",
+            "message": str(e),
+        }
 
 @mcp.tool()
 def get_current_user() -> dict:
@@ -176,36 +204,24 @@ def get_current_user() -> dict:
             "data": None,
         }
 
-
 if __name__ == "__main__":
-    # Skip server startup in Databricks interactive environments.
-    # This file is intended to be deployed as a Databricks App.
+    if hasattr(mcp, "app") and mcp.app is not None:
+        mcp.app.add_middleware(RequestContextMiddleware)
 
-    import sys
-
-    if (
-        "databricks" in sys.modules
-        or os.getenv("DATABRICKS_RUNTIME_VERSION")
-    ):
-        print(
-            "This file is designed to be deployed as a Databricks App."
+    port = int(
+        os.getenv(
+            "DATABRICKS_APP_PORT",
+            os.getenv("PORT", 8000),
         )
-        print("Use the app.yaml configuration to deploy the server.")
+    )
 
-    else:
-        # Add middleware before starting the MCP server.
-        if hasattr(mcp, "app") and mcp.app is not None:
-            mcp.app.add_middleware(RequestContextMiddleware)
+    logger.info(
+        "Starting Stock Research MCP server on port %s",
+        port,
+    )
 
-        port = int(
-            os.getenv(
-                "DATABRICKS_APP_PORT",
-                os.getenv("PORT", 8000),
-            )
-        )
-
-        mcp.run(
-            transport="http",
-            host="0.0.0.0",
-            port=port,
-        )
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=port,
+    )

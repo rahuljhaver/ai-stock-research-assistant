@@ -2,9 +2,33 @@ from datetime import date, timedelta
 
 from massive_client import MassiveClient
 
+import base64
+import psycopg2
+from sentence_transformers import SentenceTransformer
+from databricks.sdk import WorkspaceClient
+
 
 # Create one reusable API client.
 client = MassiveClient()
+
+w = WorkspaceClient()
+
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def get_lakebase_url() -> str:
+    secret = w.secrets.get_secret(
+        scope="database",
+        key="lakebase-url"
+    )
+    return base64.b64decode(secret.value).decode("utf-8")
+
+
+lakebase_connection_string = get_lakebase_url()
+
+embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL_NAME
+)
 
 
 def get_stock_price(
@@ -100,3 +124,97 @@ def get_latest_stock_price(ticker: str):
         "vwap": record.get("vw"),
         "timestamp": record.get("t"),
     }
+
+def search_stock_research_data(
+    query: str,
+    ticker: str | None = None,
+    top_k: int = 5,
+) -> dict:
+    """
+    Perform semantic search over stock news stored in Lakebase.
+
+    The query is converted to an embedding using the same
+    sentence-transformers model used during ingestion.
+    """
+
+    if not query or not query.strip():
+        raise ValueError("query is required")
+
+    top_k = max(1, min(top_k, 10))
+
+    query_vector = embedding_model.encode(
+        query
+    ).tolist()
+
+    if ticker:
+        sql = """
+        SELECT
+            a.article_id,
+            b.ticker,
+            b.title,
+            b.article_url,
+            b.published_utc,
+            a.chunk_text,
+            embedding <=> %s::vector AS distance
+        FROM ticker_news_chunk_embeddings a
+        LEFT JOIN ticker_news_documents b
+            ON a.article_id = b.id
+        WHERE b.ticker = %s
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s;
+        """
+
+        params = (
+            query_vector,
+            ticker.upper(),
+            query_vector,
+            top_k,
+        )
+
+    else:
+        sql = """
+        SELECT
+            a.article_id,
+            b.ticker,
+            b.title,
+            b.article_url,
+            b.published_utc,
+            a.chunk_text,
+            embedding <=> %s::vector AS distance
+        FROM ticker_news_chunk_embeddings a
+        LEFT JOIN ticker_news_documents b
+            ON a.article_id = b.id
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s;
+        """
+
+        params = (
+            query_vector,
+            query_vector,
+            top_k,
+        )
+
+    conn = psycopg2.connect(lakebase_connection_string)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+
+            columns = [
+                desc[0]
+                for desc in cur.description
+            ]
+
+            rows = [
+                dict(zip(columns, row))
+                for row in cur.fetchall()
+            ]
+
+        return {
+            "query": query,
+            "ticker": ticker,
+            "matches": rows,
+        }
+
+    finally:
+        conn.close()
